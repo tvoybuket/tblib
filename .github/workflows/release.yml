@@ -1,0 +1,197 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
+
+      - name: Get latest tag and calculate next version
+        id: version
+        run: |
+          # Получение последнего тега
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Current tag: $LATEST_TAG"
+
+          # Извлечение номеров версии
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            MAJOR=0
+            MINOR=0  
+            PATCH=0
+          else
+            VERSION_NUM=${LATEST_TAG#v}
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_NUM"
+          fi
+
+          # Получение коммитов с последнего тега
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            COMMITS=$(git log --oneline)
+          else
+            COMMITS=$(git log ${LATEST_TAG}..HEAD --oneline)
+          fi
+
+          # Определение типа изменения
+          if echo "$COMMITS" | grep -q "BREAKING CHANGE\|!:"; then
+            MAJOR=$((MAJOR+1))
+            MINOR=0
+            PATCH=0
+            CHANGE_TYPE="major"
+          elif echo "$COMMITS" | grep -q "feat:"; then
+            MINOR=$((MINOR+1))
+            PATCH=0
+            CHANGE_TYPE="minor"
+          else
+            PATCH=$((PATCH+1))
+            CHANGE_TYPE="patch"
+          fi
+
+          # Для первого релиза делаем 0.1.0
+          if [ "$LATEST_TAG" = "v0.0.0" ] && [ "$MAJOR" = "0" ] && [ "$MINOR" = "0" ] && [ "$PATCH" = "1" ]; then
+            MINOR=1
+            PATCH=0
+          fi
+
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+
+          # Проверка наличия изменений
+          if [ "$LATEST_TAG" = "$NEW_TAG" ] && [ "$LATEST_TAG" != "v0.0.0" ]; then
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "No changes detected, skipping release"
+          else
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+            echo "change_type=$CHANGE_TYPE" >> $GITHUB_OUTPUT
+            echo "old_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            echo "Will create release: $NEW_TAG (type: $CHANGE_TYPE)"
+          fi
+
+      - name: Create version file
+        if: steps.version.outputs.should_release == 'true'
+        run: |
+          NEW_TAG=${{ steps.version.outputs.new_tag }}
+          mkdir -p pkg/version
+
+          cat > pkg/version/version.go << 'VERSIONEOF'
+          // Package version provides version information for the library
+          package version
+
+          import "time"
+
+          // Version is the current version of the library
+          const Version = "REPLACE_VERSION"
+
+          // Tag is the current git tag  
+          const Tag = "REPLACE_TAG"
+
+          // BuildTime is when this version was built
+          var BuildTime = time.Date(REPLACE_YEAR, REPLACE_MONTH, REPLACE_DAY, REPLACE_HOUR, REPLACE_MIN, REPLACE_SEC, 0, time.UTC)
+          VERSIONEOF
+
+          # Замена плейсхолдеров
+          VERSION_CLEAN=${NEW_TAG#v}
+          BUILD_DATE=$(date -u +"%Y %m %d %H %M %S")
+          read -r YEAR MONTH DAY HOUR MIN SEC <<< "$BUILD_DATE"
+
+          sed -i "s/REPLACE_VERSION/$VERSION_CLEAN/g" pkg/version/version.go
+          sed -i "s/REPLACE_TAG/$NEW_TAG/g" pkg/version/version.go
+          sed -i "s/REPLACE_YEAR/$YEAR/g" pkg/version/version.go
+          sed -i "s/REPLACE_MONTH/$MONTH/g" pkg/version/version.go  
+          sed -i "s/REPLACE_DAY/$DAY/g" pkg/version/version.go
+          sed -i "s/REPLACE_HOUR/$HOUR/g" pkg/version/version.go
+          sed -i "s/REPLACE_MIN/$MIN/g" pkg/version/version.go
+          sed -i "s/REPLACE_SEC/$SEC/g" pkg/version/version.go
+
+          echo "Created version file:"
+          cat pkg/version/version.go
+
+      - name: Create and push tag
+        if: steps.version.outputs.should_release == 'true'
+        run: |
+          NEW_TAG=${{ steps.version.outputs.new_tag }}
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+          git push origin "$NEW_TAG"
+
+          echo "Created and pushed tag: $NEW_TAG"
+
+      - name: Generate release notes
+        if: steps.version.outputs.should_release == 'true'
+        run: |
+          NEW_TAG=${{ steps.version.outputs.new_tag }}
+          OLD_TAG=${{ steps.version.outputs.old_tag }}
+          CHANGE_TYPE=${{ steps.version.outputs.change_type }}
+
+          echo "# Release $NEW_TAG" > release_notes.md
+          echo "" >> release_notes.md
+          echo "**Change Type:** $CHANGE_TYPE" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "## What's Changed" >> release_notes.md
+          echo "" >> release_notes.md
+
+          if [ "$OLD_TAG" = "v0.0.0" ]; then
+            git log --oneline --pretty=format:"- %s (%h)" | head -10 >> release_notes.md
+          else
+            git log ${OLD_TAG}..HEAD --oneline --pretty=format:"- %s (%h)" >> release_notes.md
+          fi
+
+          echo "" >> release_notes.md
+          echo "---" >> release_notes.md
+          echo "*This release was automatically generated by GitHub Actions*" >> release_notes.md
+
+          echo "Generated release notes:"
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_TAG=${{ steps.version.outputs.new_tag }}
+
+          gh release create "$NEW_TAG" \
+            --title "Release $NEW_TAG" \
+            --notes-file release_notes.md \
+            --target main
+            
+          echo "Created GitHub release: $NEW_TAG"
